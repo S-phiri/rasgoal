@@ -1,0 +1,15 @@
+# Rasgoal
+
+> Zambian exam practice platform for Grade 7 and Grade 12 students, with timed mock tests, instant scoring, and progress tracking across every examinable subject.
+
+Rasgoal is operated by Kora Technical Solutions (PACRA BN 320261068317) and serves students preparing for ECZ Grade 7 and Grade 12 examinations. It offers a free tier and paid subscriptions (K50/month or K400/year per student).
+
+## Pages
+
+- [Home](/): Overview of Rasgoal and entry point to sign in or sign up.
+- [Sign in / Sign up](/auth): Create a Rasgoal account or log in to access practice tests.
+- [Terms & Merchant Policy](/terms): Products, refund, and cancellation policy.
+
+## Optional
+
+- [Unsubscribe](/unsubscribe): Email unsubscribe page.

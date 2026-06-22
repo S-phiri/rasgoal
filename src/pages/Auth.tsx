@@ -1,0 +1,908 @@
+import { useState } from "react";
+import { useAuth } from "@/contexts/AuthContext";
+import { useNavigate } from "react-router-dom";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { useToast } from "@/hooks/use-toast";
+import { BookOpen, Loader2, ArrowLeft, Eye, EyeOff, CheckCircle2, XCircle, Phone, Mail, Users, GraduationCap, User, School } from "lucide-react";
+import { supabase } from "@/integrations/supabase/client";
+import { lovable } from "@/integrations/lovable/index";
+
+type AuthMode = "login" | "signup" | "forgot";
+type AuthMethod = "phone" | "email";
+type SignupStep = "basics" | "credentials";
+type SignupRole = "parent" | "student" | "teacher" | "school";
+
+const ROLE_OPTIONS: { value: SignupRole; label: string; icon: typeof User; desc: string }[] = [
+  { value: "student", label: "Student", icon: GraduationCap, desc: "Practice & learn" },
+  { value: "parent", label: "Parent", icon: Users, desc: "Support your child" },
+  { value: "teacher", label: "Teacher", icon: User, desc: "Track learners" },
+  { value: "school", label: "School", icon: School, desc: "Manage students" },
+];
+
+// Decide whether a free-form contact string looks like an email
+const looksLikeEmail = (v: string) => /@/.test(v);
+// Slugify a name into a candidate username
+const slugifyName = (name: string) =>
+  name.toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 20) || "user";
+
+// Accepted mobile numbers: Zambia (+260, 9 digits) or Germany (+49, 10-11 digits)
+const ZM_PHONE_REGEX = /^\+260\d{9}$/;
+const DE_PHONE_REGEX = /^\+49\d{10,11}$/;
+
+const normalizeZmPhone = (raw: string): string | null => {
+  const digits = raw.replace(/[^\d+]/g, "");
+  let candidate = digits;
+  if (candidate.startsWith("00")) candidate = "+" + candidate.slice(2);
+
+  // Germany
+  if (candidate.startsWith("+49")) {
+    return DE_PHONE_REGEX.test(candidate) ? candidate : null;
+  }
+  if (/^49\d+$/.test(candidate) && DE_PHONE_REGEX.test("+" + candidate)) {
+    return "+" + candidate;
+  }
+
+  // Zambia (default)
+  if (candidate.startsWith("260")) candidate = "+" + candidate;
+  else if (candidate.startsWith("0")) candidate = "+260" + candidate.slice(1);
+  else if (!candidate.startsWith("+")) candidate = "+260" + candidate;
+  return ZM_PHONE_REGEX.test(candidate) ? candidate : null;
+};
+
+const phoneLoginEmail = (phone: string) => `phone-${phone.replace(/\D/g, "")}@phone.rasgoal.com`;
+
+type PhoneOtpResponse = { ok?: boolean; phone?: string; error?: string };
+
+const errorMessage = (err: unknown): string => {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "string") return err;
+  if (err && typeof err === "object" && "message" in err) {
+    const message = (err as { message?: unknown }).message;
+    if (typeof message === "string") return message;
+  }
+  return "";
+};
+
+const edgeFunctionErrorMessage = async (err: unknown): Promise<string> => {
+  const context = err && typeof err === "object" && "context" in err ? (err as { context?: Response }).context : undefined;
+  if (context instanceof Response) {
+    try {
+      const payload = await context.clone().json();
+      if (payload && typeof payload.error === "string") return payload.error;
+    } catch {
+      try {
+        const text = await context.clone().text();
+        if (text) return text;
+      } catch {
+        // Fall back to the SDK error message below.
+      }
+    }
+  }
+  return errorMessage(err);
+};
+
+const invokePhoneOtp = async (functionName: "phone-otp-send" | "phone-otp-verify", body: Record<string, unknown>): Promise<PhoneOtpResponse> => {
+  const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+  const supabaseKey = import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY;
+  const { data: { session } } = await supabase.auth.getSession();
+  const response = await fetch(`${supabaseUrl}/functions/v1/${functionName}`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      apikey: supabaseKey,
+      Authorization: `Bearer ${session?.access_token || supabaseKey}`,
+    },
+    body: JSON.stringify(body),
+  });
+  const text = await response.text();
+  let payload: PhoneOtpResponse = {};
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { error: text };
+  }
+  if (!response.ok || payload.error) throw new Error(payload.error || `Request failed (${response.status})`);
+  return payload;
+};
+
+// Maps phone-auth errors to friendly messages
+const friendlyOtpError = (err: unknown): string => {
+  const fallback = errorMessage(err);
+  const msg = fallback.toLowerCase();
+  if (msg.includes("expired")) return "Your OTP has expired. Please request a new code.";
+  if (msg.includes("invalid") && msg.includes("otp")) return "Wrong OTP code. Please try again.";
+  if (msg.includes("rate") || msg.includes("too many") || msg.includes("limit"))
+    return "Too many attempts. Please wait a few minutes and try again.";
+  if (msg.includes("network") || msg.includes("fetch")) return "Network error. Check your connection and try again.";
+  if (msg.includes("twilio") || msg.includes("sms sign-in") || msg.includes("/otp"))
+    return "Your page is still using the old SMS route. Refresh the app and try Mobile signup again.";
+  return fallback || "Something went wrong. Please try again.";
+};
+
+const passwordRules = [
+  { label: "At least 8 characters", test: (p: string) => p.length >= 8 },
+  { label: "At least 1 uppercase letter", test: (p: string) => /[A-Z]/.test(p) },
+  { label: "At least 1 number", test: (p: string) => /\d/.test(p) },
+];
+
+const Auth = () => {
+  const [mode, setMode] = useState<AuthMode>("login");
+  const [method, setMethod] = useState<AuthMethod>("phone"); // Mobile is primary
+  const [phone, setPhone] = useState("+26");
+  const [otp, setOtp] = useState("");
+  const [otpSent, setOtpSent] = useState(false);
+  const [otpPhone, setOtpPhone] = useState(""); // The normalized phone the OTP was sent to
+  // What the OTP is for: verify a freshly created account, or reset the password
+  const [otpPurpose, setOtpPurpose] = useState<"verify" | "reset">("verify");
+  const [newPassword, setNewPassword] = useState("");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [fullName, setFullName] = useState("");
+  const [username, setUsername] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [googleLoading, setGoogleLoading] = useState(false);
+  const [showPassword, setShowPassword] = useState(false);
+  const [resetSent, setResetSent] = useState(false);
+  const [signupSuccess, setSignupSuccess] = useState(false);
+  // Step 1 of signup: collect just name + contact + role
+  const [signupStep, setSignupStep] = useState<SignupStep>("basics");
+  const [signupContact, setSignupContact] = useState("");
+  const [signupRole, setSignupRole] = useState<SignupRole>("student");
+  const { signIn, signUp } = useAuth();
+  const navigate = useNavigate();
+  const { toast } = useToast();
+
+  // --- Phone + password sign-in / sign-up via Zamtel SMS OTP ---
+  // OTP is only required to verify the phone at signup, or to reset the password.
+  // Normal logins skip OTP and go straight through password.
+  const handlePhoneSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const normalized = normalizeZmPhone(phone);
+    if (!normalized) {
+      toast({
+        title: "Invalid phone number",
+        description: "Enter a valid Zambian (+260) or German (+49) mobile number",
+        variant: "destructive",
+      });
+      return;
+    }
+    setLoading(true);
+    try {
+      if (mode === "login") {
+        const { error } = await supabase.auth.signInWithPassword({
+          email: phoneLoginEmail(normalized),
+          password,
+        });
+        if (error) throw new Error("Invalid mobile number or password.");
+        navigate("/");
+        return;
+      }
+
+      // Sign up — validate, then ask backend to send a Zamtel OTP.
+      if (!passwordRules.every((r) => r.test(password))) {
+        toast({ title: "Weak password", description: "Please meet all password requirements.", variant: "destructive" });
+        setLoading(false);
+        return;
+      }
+
+      await invokePhoneOtp("phone-otp-send", { phone: normalized, purpose: "signup", fullName, username });
+
+      setOtpPhone(normalized);
+      setOtpPurpose("verify");
+      setOtpSent(true);
+      toast({ title: "Verify your number 📱", description: `We sent a 6-digit code to ${normalized}.` });
+    } catch (err: unknown) {
+      toast({ title: "Couldn't continue", description: friendlyOtpError(err), variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Send an OTP to a phone for password reset (via Zamtel)
+  const handleSendResetOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const normalized = normalizeZmPhone(phone);
+    if (!normalized) {
+      toast({
+        title: "Invalid phone number",
+        description: "Enter a valid Zambian (+260) or German (+49) mobile number",
+        variant: "destructive",
+      });
+      return;
+    }
+    setLoading(true);
+    try {
+      await invokePhoneOtp("phone-otp-send", { phone: normalized, purpose: "reset" });
+      setOtpPhone(normalized);
+      setOtpPurpose("reset");
+      setOtpSent(true);
+      toast({ title: "Reset code sent 📱", description: `Enter the code we sent to ${normalized} to set a new password.` });
+    } catch (err: unknown) {
+      toast({ title: "Couldn't send code", description: friendlyOtpError(err), variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleVerifyOtp = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (otp.length !== 6) {
+      toast({ title: "Enter 6 digits", description: "Your OTP code is 6 digits long.", variant: "destructive" });
+      return;
+    }
+    if (otpPurpose === "reset" && !passwordRules.every((r) => r.test(newPassword))) {
+      toast({ title: "Weak password", description: "Please meet all password requirements.", variant: "destructive" });
+      return;
+    }
+    setLoading(true);
+    try {
+      const isSignup = otpPurpose === "verify";
+      const passToUse = isSignup ? password : newPassword;
+
+      await invokePhoneOtp("phone-otp-verify", {
+        phone: otpPhone,
+        code: otp,
+        purpose: isSignup ? "signup" : "reset",
+        fullName: isSignup ? fullName : undefined,
+        username: isSignup ? username : undefined,
+        password: isSignup ? password : undefined,
+        newPassword: isSignup ? undefined : newPassword,
+      });
+
+      // Sign in now that the user exists (signup) or the password was rotated (reset)
+      const { error: signInErr } = await supabase.auth.signInWithPassword({
+        email: phoneLoginEmail(otpPhone),
+        password: passToUse,
+      });
+      if (signInErr) throw new Error("Your number was verified, but sign-in failed. Please sign in with your mobile number and password.");
+
+      toast({
+        title: isSignup ? "Number verified 🎉" : "Password updated 🎉",
+        description: isSignup ? "Your account is ready." : "You're signed in with your new password.",
+      });
+      navigate("/");
+    } catch (err: unknown) {
+      toast({ title: "Verification failed", description: friendlyOtpError(err), variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleResendOtp = async () => {
+    setLoading(true);
+    try {
+      await invokePhoneOtp("phone-otp-send", {
+        phone: otpPhone,
+        purpose: otpPurpose === "verify" ? "signup" : "reset",
+        fullName: otpPurpose === "verify" ? fullName : undefined,
+        username: otpPurpose === "verify" ? username : undefined,
+      });
+      toast({ title: "New code sent 📱", description: `Check ${otpPhone} for a fresh code.` });
+    } catch (err: unknown) {
+      toast({ title: "Couldn't resend", description: friendlyOtpError(err), variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  // Step 1 of signup: capture name + contact + role, then continue to credentials
+  const handleSignupBasics = (e: React.FormEvent) => {
+    e.preventDefault();
+    const name = fullName.trim();
+    const contact = signupContact.trim();
+    if (!name || !contact) {
+      toast({ title: "Missing info", description: "Please enter your name and a phone or email.", variant: "destructive" });
+      return;
+    }
+    // Persist the user's chosen role so we can apply it after auth (parent/school
+    // are stored as preference; we map them to the closest supported app role).
+    try {
+      localStorage.setItem("signup_role_preference", signupRole);
+    } catch {
+      /* ignore storage errors */
+    }
+    // Auto-derive a username from the name; user can edit it on next step if needed.
+    if (!username) setUsername(`${slugifyName(name)}${Math.floor(100 + Math.random() * 900)}`);
+    if (looksLikeEmail(contact)) {
+      setMethod("email");
+      setEmail(contact);
+    } else {
+      setMethod("phone");
+      // Reuse the phone input's +26 prefill behavior
+      const digits = contact.replace(/[^\d]/g, "");
+      setPhone(contact.startsWith("+") ? contact : "+26" + digits);
+    }
+    setSignupStep("credentials");
+  };
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    try {
+      if (mode === "login") {
+        let contact = email.trim();
+        const normalized = normalizeZmPhone(contact);
+        if (normalized) {
+          contact = phoneLoginEmail(normalized);
+        }
+        await signIn(contact, password);
+        navigate("/");
+      } else if (mode === "signup") {
+        if (!passwordRules.every((r) => r.test(password))) {
+          toast({ title: "Weak password", description: "Please meet all password requirements.", variant: "destructive" });
+          setLoading(false);
+          return;
+        }
+        await signUp(email, password, fullName, username);
+        // Referral linking is handled by AuthContext on the next sign-in
+        // (after email verification), so the ref code stays in localStorage.
+        setSignupSuccess(true);
+      } else if (mode === "forgot") {
+        const contact = email.trim();
+        const normalized = normalizeZmPhone(contact);
+        if (normalized) {
+          await invokePhoneOtp("phone-otp-send", { phone: normalized, purpose: "reset" });
+          setOtpPhone(normalized);
+          setOtpPurpose("reset");
+          setOtpSent(true);
+          toast({ title: "Reset code sent 📱", description: `Enter the code we sent to ${normalized} to set a new password.` });
+        } else {
+          const { error } = await supabase.auth.resetPasswordForEmail(contact, {
+            redirectTo: `${window.location.origin}/reset-password`,
+          });
+          if (error) throw error;
+          setResetSent(true);
+          toast({ title: "Reset email sent! 📧", description: "Check your inbox for a password reset link." });
+        }
+      }
+    } catch (error: unknown) {
+      toast({ title: "Error", description: errorMessage(error) || "Something went wrong. Please try again.", variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleGoogleSignIn = async () => {
+    setGoogleLoading(true);
+    try {
+      // Persist the selected role so we can apply it after OAuth returns
+      try {
+        localStorage.setItem("signup_role_preference", signupRole);
+      } catch {
+        /* ignore storage errors */
+      }
+      const { error } = await lovable.auth.signInWithOAuth("google", {
+        redirect_uri: window.location.origin,
+      });
+      if (error) throw error;
+    } catch (error: unknown) {
+      toast({ title: "Google sign-in failed", description: errorMessage(error) || "Something went wrong. Please try again.", variant: "destructive" });
+      setGoogleLoading(false);
+    }
+  };
+
+  const handleResendVerification = async () => {
+    setLoading(true);
+    try {
+      const { error } = await supabase.auth.resend({ type: "signup", email });
+      if (error) throw error;
+      toast({ title: "Verification email resent! 📧", description: "Check your inbox." });
+    } catch (error: unknown) {
+      toast({ title: "Error", description: errorMessage(error) || "Something went wrong. Please try again.", variant: "destructive" });
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const allRulesPass = passwordRules.every((r) => r.test(password));
+
+  // Signup success - verification pending
+  if (signupSuccess) {
+    return (
+      <div className="min-h-screen flex items-center justify-center px-4 bg-background">
+        <div className="bg-card rounded-2xl border border-border shadow-lg p-8 max-w-md w-full animate-slide-in text-center">
+          <div className="w-16 h-16 bg-success/10 rounded-full flex items-center justify-center mx-auto mb-4">
+            <CheckCircle2 className="w-8 h-8 text-success" />
+          </div>
+          <h1 className="font-display text-2xl font-bold text-foreground mb-2">Check Your Email! 📧</h1>
+          <p className="text-muted-foreground text-sm mb-6">
+            We've sent a verification link to <strong className="text-foreground">{email}</strong>. Please check your inbox and click the link to verify your account.
+          </p>
+          <div className="space-y-3">
+            <Button variant="outline" className="w-full" onClick={handleResendVerification} disabled={loading}>
+              {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+              Resend Verification Email
+            </Button>
+            <Button variant="ghost" className="w-full" onClick={() => { setSignupSuccess(false); setMode("login"); }}>
+              Back to Sign In
+            </Button>
+          </div>
+          <p className="text-xs text-muted-foreground mt-4">
+            Didn't receive the email? Check your spam folder or try resending.
+          </p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen flex items-center justify-center px-4 bg-background">
+      <div className="bg-card rounded-2xl border border-border shadow-lg p-8 max-w-md w-full animate-slide-in">
+        {/* Header */}
+        <div className="text-center mb-6">
+          {mode !== "login" && (
+            <button
+              onClick={() => {
+                // If we're on signup step 2, go back to step 1 instead of all the way to login
+                if (mode === "signup" && signupStep === "credentials") {
+                  setSignupStep("basics");
+                  setOtpSent(false);
+                  return;
+                }
+                setMode("login");
+                setResetSent(false);
+                setSignupStep("basics");
+              }}
+              className="flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground mb-4 transition-colors"
+            >
+              <ArrowLeft className="w-4 h-4" />
+              {mode === "signup" && signupStep === "credentials" ? "Back" : "Back to sign in"}
+            </button>
+          )}
+          <div className="w-16 h-16 bg-primary/10 rounded-2xl flex items-center justify-center mx-auto mb-4">
+            <BookOpen className="w-8 h-8 text-primary" />
+          </div>
+          <h1 className="font-display text-3xl font-bold text-foreground">7th & 12th Grade Exam Prep</h1>
+          <p className="text-muted-foreground mt-2">
+            {mode === "login" && "Welcome back! Sign in to continue."}
+            {mode === "signup" && "Create your account to start learning."}
+            {mode === "forgot" && "Enter your email or phone number to reset your password."}
+          </p>
+        </div>
+
+        {/* Forgot password success */}
+        {mode === "forgot" && resetSent ? (
+          <div className="text-center space-y-4">
+            <div className="w-16 h-16 bg-success/10 rounded-full flex items-center justify-center mx-auto">
+              <CheckCircle2 className="w-8 h-8 text-success" />
+            </div>
+            <p className="text-foreground font-semibold">Check your inbox!</p>
+            <p className="text-muted-foreground text-sm">
+              If an account exists for <strong>{email}</strong>, you'll receive a password reset link shortly.
+            </p>
+            <Button variant="outline" className="w-full" onClick={() => { setMode("login"); setResetSent(false); }}>
+              Back to Sign In
+            </Button>
+          </div>
+        ) : (
+          <>
+            {/* OTP verification screen (phone verify after signup OR phone password reset) */}
+            {method === "phone" && otpSent && (
+              <form onSubmit={handleVerifyOtp} className="space-y-4">
+                <div className="text-center text-sm text-muted-foreground">
+                  {otpPurpose === "verify"
+                    ? <>Enter the 6-digit code we sent to <strong className="text-foreground">{otpPhone}</strong> to verify your number.</>
+                    : <>Enter the 6-digit code we sent to <strong className="text-foreground">{otpPhone}</strong>, then choose a new password.</>}
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="otp">Verification Code</Label>
+                  <Input
+                    id="otp"
+                    inputMode="numeric"
+                    autoComplete="one-time-code"
+                    maxLength={6}
+                    placeholder="123456"
+                    value={otp}
+                    onChange={(e) => setOtp(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    className="text-center tracking-[0.5em] text-lg"
+                    required
+                  />
+                </div>
+
+                {otpPurpose === "reset" && (
+                  <div className="space-y-2">
+                    <Label htmlFor="newPassword">New Password</Label>
+                    <div className="relative">
+                      <Input
+                        id="newPassword"
+                        type={showPassword ? "text" : "password"}
+                        placeholder="••••••••"
+                        value={newPassword}
+                        onChange={(e) => setNewPassword(e.target.value)}
+                        required
+                        minLength={8}
+                        className="pr-10"
+                      />
+                      <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors">
+                        {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                      </button>
+                    </div>
+                    {newPassword.length > 0 && (
+                      <ul className="space-y-1 mt-2">
+                        {passwordRules.map((rule) => {
+                          const passes = rule.test(newPassword);
+                          return (
+                            <li key={rule.label} className={`flex items-center gap-2 text-xs ${passes ? "text-success" : "text-muted-foreground"}`}>
+                              {passes ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+                              {rule.label}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </div>
+                )}
+
+                <Button type="submit" className="w-full py-6 text-base font-semibold" disabled={loading || otp.length !== 6}>
+                  {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+                  {otpPurpose === "reset" ? "Reset Password & Continue" : "Verify & Continue"}
+                </Button>
+                <div className="flex items-center justify-between text-sm">
+                  <button type="button" onClick={() => { setOtpSent(false); setOtp(""); setNewPassword(""); }} className="text-muted-foreground hover:text-foreground">
+                    ← Change number
+                  </button>
+                  <button type="button" onClick={handleResendOtp} disabled={loading} className="text-primary hover:underline font-medium">
+                    Resend code
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* Signup step 1: just Name + Contact + Role */}
+            {!otpSent && mode === "signup" && signupStep === "basics" && (
+              <form onSubmit={handleSignupBasics} className="space-y-5">
+                <div className="space-y-2">
+                  <Label htmlFor="basicsName">Name</Label>
+                  <Input
+                    id="basicsName"
+                    placeholder="Your full name"
+                    value={fullName}
+                    onChange={(e) => setFullName(e.target.value)}
+                    required
+                    autoComplete="name"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="basicsContact">Phone or email</Label>
+                  <Input
+                    id="basicsContact"
+                    placeholder="0971234567 or you@example.com"
+                    value={signupContact}
+                    onChange={(e) => setSignupContact(e.target.value)}
+                    required
+                    autoComplete="email"
+                  />
+                  <p className="text-xs text-muted-foreground">We'll use this to sign you in and contact you.</p>
+                </div>
+                <div className="space-y-2">
+                  <Label>I am a…</Label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {ROLE_OPTIONS.map((opt) => {
+                      const Icon = opt.icon;
+                      const active = signupRole === opt.value;
+                      return (
+                        <button
+                          key={opt.value}
+                          type="button"
+                          onClick={() => setSignupRole(opt.value)}
+                          className={`flex items-start gap-2 p-3 rounded-lg border-2 text-left transition-colors ${
+                            active
+                              ? "border-primary bg-primary/5"
+                              : "border-border hover:border-primary/40 hover:bg-muted/50"
+                          }`}
+                          aria-pressed={active}
+                        >
+                          <Icon className={`w-5 h-5 mt-0.5 ${active ? "text-primary" : "text-muted-foreground"}`} />
+                          <div>
+                            <div className={`text-sm font-semibold ${active ? "text-foreground" : "text-foreground"}`}>{opt.label}</div>
+                            <div className="text-xs text-muted-foreground">{opt.desc}</div>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+                <Button type="submit" className="w-full py-6 text-base font-semibold">
+                  Continue
+                </Button>
+
+                <div className="relative">
+                  <div className="absolute inset-0 flex items-center">
+                    <span className="w-full border-t border-border" />
+                  </div>
+                  <div className="relative flex justify-center text-xs uppercase">
+                    <span className="bg-card px-2 text-muted-foreground">Or</span>
+                  </div>
+                </div>
+
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-full py-5 text-sm font-medium gap-3"
+                  onClick={handleGoogleSignIn}
+                  disabled={googleLoading}
+                >
+                  {googleLoading ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <svg className="w-4 h-4" viewBox="0 0 24 24">
+                      <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/>
+                      <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                      <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+                      <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+                    </svg>
+                  )}
+                  Sign up with Google
+                </Button>
+
+                <div className="text-center">
+                  <button type="button" onClick={() => { setMode("login"); }} className="text-sm text-primary hover:underline font-medium">
+                    Already have an account? Sign in
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {/* Method toggle + Google + divider — only when not in OTP-entry and not on signup step 1 */}
+            {!otpSent && !(mode === "signup" && signupStep === "basics") && (
+              <div className="mb-4">
+                {/* Method switcher: phone (primary) / email (secondary) */}
+                <div className={`grid grid-cols-2 gap-2 p-1 bg-muted rounded-lg mb-4 ${mode !== "signup" ? "hidden" : ""}`}>
+                  <button
+                    type="button"
+                    onClick={() => setMethod("phone")}
+                    className={`flex items-center justify-center gap-2 py-2 rounded-md text-sm font-medium transition-colors ${
+                      method === "phone" ? "bg-card text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <Phone className="w-4 h-4" /> Mobile
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMethod("email")}
+                    className={`flex items-center justify-center gap-2 py-2 rounded-md text-sm font-medium transition-colors ${
+                      method === "email" ? "bg-card text-foreground shadow-sm" : "text-muted-foreground hover:text-foreground"
+                    }`}
+                  >
+                    <Mail className="w-4 h-4" /> Email
+                  </button>
+                </div>
+
+                {/* Phone flow: login/signup use password; forgot sends OTP to reset */}
+                {method === "phone" && mode !== "forgot" && mode !== "login" && (
+                  <form onSubmit={handlePhoneSubmit} className="space-y-4">
+                    {mode === "signup" && (
+                      <>
+                        <div className="space-y-2">
+                          <Label htmlFor="fullNamePhone">Full Name</Label>
+                          <Input id="fullNamePhone" placeholder="Your full name" value={fullName} onChange={(e) => setFullName(e.target.value)} required />
+                        </div>
+                        <div className="space-y-2">
+                          <Label htmlFor="usernamePhone">Username</Label>
+                          <Input id="usernamePhone" placeholder="Choose a unique username" value={username} onChange={(e) => setUsername(e.target.value.replace(/\s/g, ''))} required minLength={3} maxLength={30} />
+                          <p className="text-xs text-muted-foreground">3-30 characters, no spaces</p>
+                        </div>
+                      </>
+                    )}
+                    <div className="space-y-2">
+                      <Label htmlFor="phone">Mobile Number</Label>
+                      <Input
+                        id="phone"
+                        type="tel"
+                        inputMode="tel"
+                        autoComplete="tel"
+                        placeholder="0971234567"
+                        value={phone}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (!val.startsWith("+26")) {
+                            const digits = val.replace(/[^\d]/g, "");
+                            setPhone("+26" + digits);
+                          } else {
+                            setPhone(val);
+                          }
+                        }}
+                        required
+                      />
+                      <p className="text-xs text-muted-foreground">Enter your number after +26 (e.g. 0971234567)</p>
+                    </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="phonePassword">Password</Label>
+                      <div className="relative">
+                        <Input
+                          id="phonePassword"
+                          type={showPassword ? "text" : "password"}
+                          placeholder="••••••••"
+                          value={password}
+                          onChange={(e) => setPassword(e.target.value)}
+                          required
+                          minLength={mode === "signup" ? 8 : 6}
+                          className="pr-10"
+                        />
+                        <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors">
+                          {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                        </button>
+                      </div>
+                      {mode === "signup" && password.length > 0 && (
+                        <ul className="space-y-1 mt-2">
+                          {passwordRules.map((rule) => {
+                            const passes = rule.test(password);
+                            return (
+                              <li key={rule.label} className={`flex items-center gap-2 text-xs ${passes ? "text-success" : "text-muted-foreground"}`}>
+                                {passes ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+                                {rule.label}
+                              </li>
+                            );
+                          })}
+                        </ul>
+                      )}
+                    </div>
+                    <Button type="submit" className="w-full py-6 text-base font-semibold" disabled={loading}>
+                      {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+                      Create Account
+                    </Button>
+                  </form>
+                )}
+
+                {/* Phone forgot-password flow: send OTP to reset */}
+                {false && (
+                  <form onSubmit={handleSendResetOtp} className="space-y-4">
+                    <div className="space-y-2">
+                      <Label htmlFor="phoneReset">Mobile Number</Label>
+                      <Input
+                        id="phoneReset"
+                        type="tel"
+                        inputMode="tel"
+                        autoComplete="tel"
+                        placeholder="0971234567"
+                        value={phone}
+                        onChange={(e) => {
+                          const val = e.target.value;
+                          if (!val.startsWith("+26")) {
+                            const digits = val.replace(/[^\d]/g, "");
+                            setPhone("+26" + digits);
+                          } else {
+                            setPhone(val);
+                          }
+                        }}
+                        required
+                      />
+                      <p className="text-xs text-muted-foreground">Enter your number after +26 (e.g. 0971234567)</p>
+                    </div>
+                    <Button type="submit" className="w-full py-6 text-base font-semibold" disabled={loading}>
+                      {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+                      Send Reset Code
+                    </Button>
+                  </form>
+                )}
+
+
+                {/* Email method: Google + divider + email/password form below */}
+                {(method === "email" || mode === "login") && (
+                  <>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      className="w-full py-5 text-sm font-medium gap-3"
+                      onClick={handleGoogleSignIn}
+                      disabled={googleLoading}
+                    >
+                      {googleLoading ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <svg className="w-4 h-4" viewBox="0 0 24 24">
+                          <path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 01-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/>
+                          <path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/>
+                          <path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/>
+                          <path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/>
+                        </svg>
+                      )}
+                      {mode === "login" ? "Sign in with Google" : "Sign up with Google"}
+                    </Button>
+
+                    <div className="relative my-4">
+                      <div className="absolute inset-0 flex items-center">
+                        <span className="w-full border-t border-border" />
+                      </div>
+                      <div className="relative flex justify-center text-xs uppercase">
+                        <span className="bg-card px-2 text-muted-foreground">or continue with email</span>
+                      </div>
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
+
+
+            {(method === "email" || mode === "login" || mode === "forgot") && !otpSent && !(mode === "signup" && signupStep === "basics") && (
+            <form onSubmit={handleSubmit} className="space-y-4">
+              {mode === "signup" && (
+                <>
+                  <div className="space-y-2">
+                    <Label htmlFor="fullName">Full Name</Label>
+                    <Input id="fullName" placeholder="Your full name" value={fullName} onChange={(e) => setFullName(e.target.value)} required />
+                  </div>
+                  <div className="space-y-2">
+                    <Label htmlFor="username">Username</Label>
+                    <Input id="username" placeholder="Choose a unique username" value={username} onChange={(e) => setUsername(e.target.value.replace(/\s/g, ''))} required minLength={3} maxLength={30} />
+                    <p className="text-xs text-muted-foreground">3-30 characters, no spaces</p>
+                  </div>
+                </>
+              )}
+
+              <div className="space-y-2">
+                <Label htmlFor="email">{mode === "login" ? "Email, username, or phone number" : "Email"}</Label>
+                <Input id="email" type={mode === "login" ? "text" : "email"} placeholder={mode === "login" ? "Email, username, or phone number" : "you@example.com"} value={email} onChange={(e) => setEmail(e.target.value)} required />
+              </div>
+
+              {mode !== "forgot" && (
+                <div className="space-y-2">
+                  <Label htmlFor="password">Password</Label>
+                  <div className="relative">
+                    <Input
+                      id="password"
+                      type={showPassword ? "text" : "password"}
+                      placeholder="••••••••"
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      required
+                      minLength={mode === "signup" ? 8 : 6}
+                      className="pr-10"
+                    />
+                    <button type="button" onClick={() => setShowPassword(!showPassword)} className="absolute right-3 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground transition-colors">
+                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+
+                  {mode === "login" && (
+                    <button type="button" onClick={() => setMode("forgot")} className="text-xs text-primary hover:underline font-medium">
+                      Forgot Password?
+                    </button>
+                  )}
+
+                  {mode === "signup" && password.length > 0 && (
+                    <ul className="space-y-1 mt-2">
+                      {passwordRules.map((rule) => {
+                        const passes = rule.test(password);
+                        return (
+                          <li key={rule.label} className={`flex items-center gap-2 text-xs ${passes ? "text-success" : "text-muted-foreground"}`}>
+                            {passes ? <CheckCircle2 className="w-3.5 h-3.5" /> : <XCircle className="w-3.5 h-3.5" />}
+                            {rule.label}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </div>
+              )}
+
+              <Button
+                type="submit"
+                className="w-full py-6 text-base font-semibold"
+                disabled={loading || (mode === "signup" && !allRulesPass && password.length > 0)}
+              >
+                {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+                {mode === "login" && "Sign In"}
+                {mode === "signup" && "Create Account"}
+                {mode === "forgot" && "Continue"}
+              </Button>
+            </form>
+            )}
+          </>
+        )}
+
+        {mode !== "forgot" && !resetSent && !otpSent && !(mode === "signup" && signupStep === "basics") && (
+          <div className="mt-6 text-center">
+            <button onClick={() => { setMode(mode === "login" ? "signup" : "login"); setSignupStep("basics"); }} className="text-sm text-primary hover:underline font-medium">
+              {mode === "login" ? "Don't have an account? Create Account" : "Already have an account? Sign in"}
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+export default Auth;

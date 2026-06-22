@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" sizes="512x512" href="/favicon.png" />
+    <link rel="shortcut icon" href="/favicon.ico" />
+    <link rel="apple-touch-icon" href="/favicon.png" />
+    <title>Rasgoal — Zambian Grade 7 & 12 Exam Practice</title>
+    <meta name="description" content="Rasgoal helps Zambian students master Grade 7 and Grade 12 exams with timed mock tests, instant scoring, and progress tracking across every examinable subject." />
+    <meta name="author" content="Rasgoal" />
+    <link rel="canonical" href="https://rasgoal.com/" />
+
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://rasgoal.com/" />
+    <meta property="og:title" content="Rasgoal — Zambian Grade 7 & 12 Exam Practice" />
+    <meta property="og:description" content="Timed mock exams, instant scoring, and progress tracking for Zambian Grade 7 and Grade 12 students." />
+    <meta property="og:image" content="https://rasgoal.com/og-graduation.jpg" />
+
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="Rasgoal — Zambian Grade 7 & 12 Exam Practice" />
+    <meta name="twitter:description" content="Timed mock exams, instant scoring, and progress tracking for Zambian Grade 7 and Grade 12 students." />
+    <meta name="twitter:image" content="https://rasgoal.com/og-graduation.jpg" />
+
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "Organization",
+        "name": "Rasgoal",
+        "url": "https://rasgoal.com/",
+        "logo": "https://rasgoal.com/favicon.png",
+        "description": "Zambian Grade 7 and Grade 12 exam practice platform by Kora Technical Solutions."
+      }
+    </script>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "WebSite",
+        "name": "Rasgoal",
+        "url": "https://rasgoal.com/"
+      }
+    </script>
+    <script type="application/ld+json">
+      {
+        "@context": "https://schema.org",
+        "@type": "EducationalOrganization",
+        "name": "Rasgoal",
+        "url": "https://rasgoal.com/",
+        "description": "Online exam practice for Zambian Grade 7 and Grade 12 students across all examinable subjects."
+      }
+    </script>
+  </head>
+
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+    <script>
+      // Disable right-click context menu
+      document.addEventListener('contextmenu', function(e) { e.preventDefault(); });
+      // Disable copy, cut, paste
+      document.addEventListener('copy', function(e) { e.preventDefault(); });
+      document.addEventListener('cut', function(e) { e.preventDefault(); });
+      document.addEventListener('paste', function(e) { e.preventDefault(); });
+      // Block common screenshot/print shortcuts
+      document.addEventListener('keydown', function(e) {
+        if (e.key === 'PrintScreen') { e.preventDefault(); }
+        if ((e.ctrlKey || e.metaKey) && e.key === 'p') { e.preventDefault(); }
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 's' || e.key === 'S')) { e.preventDefault(); }
+        if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === 'i' || e.key === 'I')) { e.preventDefault(); }
+        if ((e.ctrlKey || e.metaKey) && (e.key === 'u' || e.key === 'U')) { e.preventDefault(); }
+      });
+    </script>
+  </body>
+</html>
